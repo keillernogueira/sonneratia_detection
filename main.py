@@ -24,7 +24,7 @@ def main():
 
     # general options
     parser.add_argument('--operation', type=str, required=True,
-                        help='Operation', choices=['train', 'inference', 'bbox_generation', 'patch_generation'])
+                        help='Operation', choices=['train', 'val', 'test', 'bbox_generation', 'patch_generation'])
     parser.add_argument('--output_path', type=str, required=False,
                         help='Path to save outcomes (like trained models)')
 
@@ -100,15 +100,44 @@ def main():
                 name='geo_detection',
                 patience=10
             )
-    elif args.operation == 'inference':
+    elif args.operation == 'val':
+        val_dataset = GeoObjectDetectionDataset(
+            annotations_file=os.path.join(args.output_patches_path, 'val_annotations.json'),
+            images_dir=os.path.join(args.output_patches_path, 'images'),
+            transforms=get_transforms(train=False)
+        )
+        val_loader = DataLoader(
+            val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=4, collate_fn=collate_fn
+        )
+        
+        # Train model
+        if args.model == 'faster':
+            trainer = ObjectDetectionTrainer(num_classes=1, output_path=args.output_path,
+                                            learning_rate=args.learning_rate, 
+                                            weight_decay=args.weight_decay, trained_model=args.model_path)
+            metrics = trainer.evaluate(val_loader, plot_samples=True)
+            print(f"Validation metrics: {metrics}")
+        else:
+            create_yolo_config(args.output_patches_path)
+
+            # Train YOLO
+            model = YOLO('yolov8n.pt')  # Load pretrained model
+            results = model.train(
+                data='dataset/data.yaml',
+                epochs=args.epoch_num,
+                imgsz=512,
+                batch=args.batch_size,
+                name='geo_detection',
+                patience=10
+            )
+    elif args.operation == 'test':
         # Run inference
         inference = GeoRasterInference(
             model_path=args.model_path,
             raster_path=args.input_raster_path,
-            output_shapefile='detections.shp',
+            output_shapefile='output/inference_shp/detections.shp',
             patch_size=512,
-            stride=256,
-            confidence_threshold=0.5
+            confidence_threshold=0.3
         )
 
         detections_gdf = inference.run_inference()

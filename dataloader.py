@@ -89,7 +89,8 @@ class GeoObjectDetectionDataset(Dataset):
             'labels': labels,
             'image_id': torch.tensor([ann['image_id']]),
             'area': (boxes[:, 3] - boxes[:, 1]) * (boxes[:, 2] - boxes[:, 0]),
-            'iscrowd': torch.zeros((boxes.shape[0],), dtype=torch.int64)
+            'iscrowd': torch.zeros((boxes.shape[0],), dtype=torch.int64),
+            'img_path': str(img_path)
         }
         
         return image, target

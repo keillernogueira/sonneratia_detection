@@ -3,7 +3,9 @@ import rasterio
 import numpy as np
 import geopandas as gpd
 
+import cv2
 from pathlib import Path
+from requests import patch
 from tqdm import tqdm
 from rasterio.windows import Window
 from shapely.geometry import box
@@ -15,6 +17,7 @@ from torchvision.ops import box_iou
 from torchvision.models.detection import fasterrcnn_resnet50_fpn
 from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
 from torch.utils.tensorboard import SummaryWriter
+from utils import plot_bb
 
 
 class ObjectDetectionTrainer:
@@ -22,8 +25,8 @@ class ObjectDetectionTrainer:
     Trainer for object detection on georeferenced patches
     """
     
-    def __init__(self, num_classes, output_path, learning_rate=0.005, weight_decay=0.0005, 
-                 device='cuda'):
+    def __init__(self, num_classes, output_path, trained_model=None, 
+                 learning_rate=0.005, weight_decay=0.0005, device='cuda'):
         self.num_classes = num_classes
         self.output_path = output_path
         self.device = torch.device(device if torch.cuda.is_available() else 'cpu')
@@ -32,6 +35,9 @@ class ObjectDetectionTrainer:
         
         # Load pre-trained model
         self.model = self.get_model()
+        # self.model = fasterrcnn_resnet50_fpn(pretrained=False, num_classes=2)
+        if trained_model is not None:
+            self.model.load_state_dict(torch.load(trained_model)['model_state_dict'])
         self.model.to(self.device)
         
         # Optimizer
@@ -163,7 +169,7 @@ class ObjectDetectionTrainer:
         return avg_loss
     
     @torch.no_grad()
-    def evaluate(self, data_loader):
+    def evaluate(self, data_loader, plot_samples=False):
         """Evaluate model"""
         self.model.eval()
         
@@ -173,6 +179,9 @@ class ObjectDetectionTrainer:
         for images, targets in tqdm(data_loader, desc='Evaluating'):
             images = list(image.to(self.device) for image in images)
             outputs = self.model(images, targets)
+            print('preds', outputs)
+            print('-----------------------')
+            print('targets', targets)
             
             for pred, target in zip(outputs, targets):
                 all_predictions.append({
@@ -184,6 +193,8 @@ class ObjectDetectionTrainer:
                     'boxes': target['boxes'].cpu(),
                     'labels': target['labels'].cpu()
                 })
+                if plot_samples:
+                    plot_bb(target['img_path'], pred['boxes'].cpu(), bbox_target=target['boxes'].cpu())
         
         # Calculate mAP
         metrics = self.calculate_map(all_predictions, all_targets, iou_threshold=0.5)
@@ -246,30 +257,25 @@ class GeoRasterInference:
     """
     Run inference on full georeferenced raster
     """
-    
     def __init__(self, model_path, raster_path, output_shapefile,
-                 patch_size=512, stride=256, confidence_threshold=0.5):
+                 patch_size=512, overlap=0.3, confidence_threshold=0.5, device='cuda'):
         self.raster_path = raster_path
         self.output_shapefile = output_shapefile
         self.patch_size = patch_size
-        self.stride = stride
+        self.stride = int(patch_size * (1 - overlap))
         self.confidence_threshold = confidence_threshold
-        
-        # Load model
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        checkpoint = torch.load(model_path)
+        self.device = device
         
         self.model = fasterrcnn_resnet50_fpn(pretrained=False, num_classes=2)
-        self.model.load_state_dict(checkpoint['model_state_dict'])
-        self.model.to(self.device)
+        self.model.load_state_dict(torch.load(model_path)['model_state_dict'])
+        self.model.to(device)
         self.model.eval()
         
         # Open raster
         self.raster = rasterio.open(raster_path)
         
         print(f"Model loaded from {model_path}")
-        print(f"Raster: {raster_path}")
-        print(f"Device: {self.device}")
+        print(f"Raster load from: {raster_path}")
     
     def predict_patch(self, patch):
         """Run prediction on a single patch"""
@@ -278,7 +284,8 @@ class GeoRasterInference:
         patch = (patch - np.array([0.485, 0.456, 0.406])) / np.array([0.229, 0.224, 0.225])
         
         # To tensor
-        patch_tensor = torch.from_numpy(patch).permute(2, 0, 1).unsqueeze(0)
+        patch_tensor = torch.from_numpy(patch).permute(2, 0, 1).unsqueeze(0).float()
+        # print(f"✓ Patch tensor shape: {patch_tensor.shape}")  # Debugging line
         patch_tensor = patch_tensor.to(self.device)
         
         # Predict
@@ -287,23 +294,57 @@ class GeoRasterInference:
         
         return predictions[0]
     
+    def apply_nms_geo(self, gdf, iou_threshold=0.5):
+        """Apply Non-Maximum Suppression to remove duplicate detections"""
+        from shapely.ops import unary_union
+        
+        # Sort by confidence
+        gdf = gdf.sort_values('confidence', ascending=False).reset_index(drop=True)
+        
+        keep = []
+        while len(gdf) > 0:
+            # Keep highest confidence detection
+            keep.append(gdf.iloc[0])
+            
+            if len(gdf) == 1:
+                break
+            
+            # Calculate IoU with remaining boxes
+            current_box = gdf.iloc[0].geometry
+            remaining = gdf.iloc[1:]
+            
+            # Filter out overlapping boxes
+            ious = remaining.geometry.apply(
+                lambda x: current_box.intersection(x).area / current_box.union(x).area
+            )
+            
+            gdf = remaining[ious < iou_threshold].reset_index(drop=True)
+        
+        return gpd.GeoDataFrame(keep, crs=gdf.crs)
+
     def run_inference(self):
         """Run inference on full raster"""
         detections = []
         
         raster_height, raster_width = self.raster.shape[0], self.raster.shape[1]
         
-        for row_off in tqdm(range(0, raster_height - self.patch_size + 1, self.stride),
-                           desc="Processing raster"):
+        for row_off in tqdm(range(0, raster_height - self.patch_size + 1, self.stride), 
+                            desc="Processing raster"):
             for col_off in range(0, raster_width - self.patch_size + 1, self.stride):
                 
                 # Read patch
                 window = Window(col_off, row_off, self.patch_size, self.patch_size)
                 patch = self.raster.read(window=window)
                 patch = np.transpose(patch, (1, 2, 0))
+                patch = cv2.cvtColor(patch, cv2.COLOR_RGB2BGR)
+
+                binc = np.bincount(patch.flatten())
+                if binc[0] + binc[1] > binc[1:-1].sum() * 10:
+                    continue
                 
                 # Predict
                 pred = self.predict_patch(patch)
+                # print(pred)
                 
                 # Filter by confidence
                 keep = pred['scores'] > self.confidence_threshold
@@ -353,32 +394,4 @@ class GeoRasterInference:
         
         return gdf
     
-    def apply_nms_geo(self, gdf, iou_threshold=0.5):
-        """Apply Non-Maximum Suppression to remove duplicate detections"""
-        from shapely.ops import unary_union
-        
-        # Sort by confidence
-        gdf = gdf.sort_values('confidence', ascending=False).reset_index(drop=True)
-        
-        keep = []
-        while len(gdf) > 0:
-            # Keep highest confidence detection
-            keep.append(gdf.iloc[0])
-            
-            if len(gdf) == 1:
-                break
-            
-            # Calculate IoU with remaining boxes
-            current_box = gdf.iloc[0].geometry
-            remaining = gdf.iloc[1:]
-            
-            # Filter out overlapping boxes
-            ious = remaining.geometry.apply(
-                lambda x: current_box.intersection(x).area / current_box.union(x).area
-            )
-            
-            gdf = remaining[ious < iou_threshold].reset_index(drop=True)
-        
-        return gpd.GeoDataFrame(keep, crs=gdf.crs)
- 
  

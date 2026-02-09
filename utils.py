@@ -20,37 +20,56 @@ def create_yolo_config(dataset_path):
         yaml.dump(config, f)
 
 
-def plot_bb(image_path, bbox):
+def plot_bb(image_path, bbox, bbox_target=None):
+    print('in plot_bb', image_path, bbox, bbox_target)
     img = Image.open(image_path)
     img_np = np.array(img)
 
     # Image size
     img_h, img_w, _ = img_np.shape
 
-    x1, y1, x2, y2 = bbox
+    for bb in bbox:
+        x1, y1, x2, y2 = bb
 
-    bbox_width = x2 - x1
-    bbox_height = y2 - y1
-    print(f"Bounding box size: {bbox_width:.2f} x {bbox_height:.2f} pixels")
-    print(bbox_height * bbox_width, bbox_height * bbox_width / (img_h * img_w))
+        bbox_width = x2 - x1
+        bbox_height = y2 - y1
+        print(f"Bounding box size: {bbox_width:.2f} x {bbox_height:.2f} pixels")
+        print(bbox_height * bbox_width, bbox_height * bbox_width / (img_h * img_w))
 
-    # Plot image
-    fig, ax = plt.subplots()
-    ax.imshow(img_np)
+        # Plot image
+        fig, ax = plt.subplots()
+        ax.imshow(img_np)
 
-    # Draw bounding box
-    rect = patches.Rectangle(
-        (x1, y1),
-        x2 - x1,
-        y2 - y1,
-        linewidth=2,
-        edgecolor="red",
-        facecolor="none"
-    )
-    ax.add_patch(rect)
+        # Draw bounding box
+        rect = patches.Rectangle(
+            (x1, y1),
+            x2 - x1,
+            y2 - y1,
+            linewidth=2,
+            edgecolor="red",
+            facecolor="none"
+        )
+        ax.add_patch(rect)
+
+    if bbox_target is not None:
+        for bbt in bbox_target:
+            x1_t, y1_t, x2_t, y2_t = bbt
+            rect_target = patches.Rectangle(
+                (x1_t, y1_t),
+                x2_t - x1_t,
+                y2_t - y1_t,
+                linewidth=2,
+                edgecolor="blue",
+                facecolor="none"
+            )
+            ax.add_patch(rect_target)
+
     ax.axis("off")
 
-    plt.show()
+    # plt.show()
+    result_img_path = os.path.join("output/val_preds", os.path.basename(image_path).replace('.png', '.jpg'))
+    fig.savefig(result_img_path)
+    plt.close(fig)
 
 
 if __name__ == "__main__":
